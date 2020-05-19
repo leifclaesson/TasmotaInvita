@@ -1,0 +1,7 @@
+sloeber.ino.cpp
+WiFi-setup.h
+.settings/*
+.project
+.cproject
+Release/*
+spec.d
