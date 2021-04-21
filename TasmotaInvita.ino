@@ -1,11 +1,15 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
+#include <LittleFS.h>
+#include <list>
 
 #define csprintf(...) { Serial.printf(__VA_ARGS__ ); }
 
 //create your own WiFi-setup.h with your user name and password (see WiFi-setup.h.sample)
 // or use the #define statements below.
 #include "WiFi-setup.h"
+
+#define UPLOAD_FILE
 
 //#define WIFI_SSID "linksys-e2000"
 //#define WIFI_PASS "12345678"
@@ -113,6 +117,15 @@ void DimLed(int level)
   #endif
 }
 
+class IgnoreItem
+{
+public:
+	String strSSID;
+	uint32_t ulTimestamp;
+};
+
+std::list<IgnoreItem> listIgnore;
+
 //The setup function is called once at startup of the sketch
 void setup()
 {
@@ -132,13 +145,80 @@ void setup()
 	
 	SetLed(0);
 
+#ifdef UPLOAD_FILE
+	csprintf("\n### Tasmota-Converta by Leif Claesson ###\n");
+#else
 	csprintf("\n### Tasmota-Invita by Leif Claesson ###\n");
+#endif
 
 
 }
 
 bool bFirst = true;
 int iStreak = 0;
+
+
+
+bool DoHttpUpload()
+{
+	//csprintf("HttpRequest test!\n");
+
+	const char * szFilename="Lightbulb.bin";
+
+	if(!LittleFS.begin())
+	{
+		csprintf("couldn't open littlefs\n");
+		return false;
+	}
+
+	File myfile=LittleFS.open(szFilename, "r");
+
+	if(!myfile)
+	{
+		csprintf("Unable to open %s\n",szFilename);
+		return false;
+	}
+
+	csprintf("File %s opened! size %u\n",szFilename,myfile.size());
+
+
+//	String url="http://172.22.22.40:7381/dev_upload";
+	char use_url[256];
+	sprintf(use_url, "http://%s/u2", WiFi.gatewayIP().toString().c_str());
+
+	http.setTimeout(5000);
+	http.begin(httpWifiClient,use_url);  //Specify request destination
+
+	csprintf("\nUploading %s to %s ...\n",szFilename,use_url);
+
+    int httpCode = http.sendRequest("POST",&myfile,myfile.size(),szFilename,"application/octet-stream","data");
+
+    // httpCode will be negative on error
+    if (httpCode > 0)
+    {
+      // HTTP header has been send and Server response header has been handled
+      Serial.printf("[HTTP] POST... code: %d\n", httpCode);
+
+      // file found at server
+      if (httpCode == HTTP_CODE_OK) {
+        const String& payload = http.getString();
+        Serial.println("received payload:\n<<");
+        Serial.println(payload);
+        Serial.println(">>");
+      }
+      http.end();
+      return true;
+    }
+    else
+    {
+      Serial.printf("[HTTP] POST... failed, error: %s\n", http.errorToString(httpCode).c_str());
+    }
+
+    http.end();
+    return false;
+
+
+}
 
 
 void loop()
@@ -150,7 +230,13 @@ void loop()
 	WiFi.disconnect();
 
 
-	Serial.printf("\nInviting AP-mode tasmota devices to network %s.\n\nScanning...",WIFI_SSID);
+
+
+#ifdef UPLOAD_FILE
+	Serial.printf("\nScanning for AP-mode tasmota devices to convert.\n\n");
+#else
+	Serial.printf("\nScanning for AP-mode tasmota devices to invite to network %s.\n\n",WIFI_SSID);
+#endif
 
 	// WiFi.scanNetworks will return the number of networks found
 	int n = WiFi.scanNetworks();
@@ -185,7 +271,6 @@ reuse_list:
 		*/
 
 
-
 		Serial.print(" Ch  BSSID              RSSI  Encr  SSID\n");
 
 		tasmotas = 0;
@@ -197,6 +282,38 @@ reuse_list:
 			{
 				continue;
 			}
+
+			std::list<IgnoreItem>::iterator iter;
+			for(iter=listIgnore.begin();iter!=listIgnore.end();)
+			{
+				IgnoreItem & item=*iter;
+				int age=(millis()-item.ulTimestamp);
+
+				if(age>30000)
+				{
+					//too old
+					//csprintf("%s too old to ignore (%i ms), erasing\n",item.strSSID.c_str(),age);
+					iter=listIgnore.erase(iter);
+				}
+				else
+				{
+					if(item.strSSID==WiFi.SSID(i))
+					{
+						//csprintf("Ignoring %s age %i!\n",item.strSSID.c_str(),age);
+						network_flag[i]=true;
+					}
+					iter++;
+				}
+			}
+
+			if(network_flag[i])
+			{
+				continue;
+			}
+
+
+
+
 			int ch = WiFi.channel(i);
 			Serial.print(ch < 10 ? "  " : " ");
 			Serial.print(ch);
@@ -300,6 +417,51 @@ reuse_list:
 			//delay(1000);
 			csprintf("Our IP is %s, Gateway is %s\n", WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str());
 
+#ifdef UPLOAD_FILE
+
+			char use_url[256];
+			sprintf(use_url, "http://%s/cm?cmnd=SetOption78%%201", WiFi.gatewayIP().toString().c_str());
+
+			int result = HttpRequest(use_url, 3);
+			//int result=200;
+
+			if(result == 200)
+			{
+				csprintf("SetOption78 success!\n");
+
+				DimLed(PWM_RANGE>>3);
+
+				bool bSuccess=DoHttpUpload();
+
+				IgnoreItem ignore;
+				ignore.strSSID=WiFi.SSID();
+				ignore.ulTimestamp=millis();
+
+				listIgnore.push_back(ignore);
+
+				if(bSuccess)
+				{
+					for(int i=0;i<3;i++)
+					{
+						SetLed(1);
+						delay(500);
+						SetLed(0);
+						delay(500);
+					}
+				}
+				else
+				{
+					SetLed(0);
+					delay(200);
+					SetLed(1);
+					delay(2000);
+					SetLed(0);
+				}
+			}
+
+#else
+
+
 			char use_url[256];
 			sprintf(use_url, "http://%s/wi?s1=%s&p1=%s&save=", WiFi.gatewayIP().toString().c_str(), WIFI_SSID, WIFI_PASS);
 
@@ -340,6 +502,7 @@ reuse_list:
 				SetLed(0);
 				csprintf("error.\n");
 			}
+#endif
 
 
 			SetLed(0);
